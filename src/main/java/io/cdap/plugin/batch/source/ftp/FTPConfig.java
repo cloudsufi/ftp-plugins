@@ -22,6 +22,7 @@ import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
+import io.cdap.cdap.api.annotation.Name;
 import io.cdap.cdap.api.data.schema.Schema;
 import io.cdap.cdap.api.plugin.PluginConfig;
 import io.cdap.cdap.etl.api.FailureCollector;
@@ -58,6 +59,9 @@ public class FTPConfig extends PluginConfig implements FileSourceProperties {
   private static final Type MAP_STRING_STRING_TYPE = new TypeToken<Map<String, String>>() {
   }.getType();
   private static final List<String> LOCATION_PROPERTIES = Arrays.asList("type", "host", "path", "user", "password");
+  private static final String NAME_SHEET = "sheet";
+  private static final String NAME_SHEET_VALUE = "sheetValue";
+  private static final String NAME_TERMINATE_IF_EMPTY_ROW = "terminateIfEmptyRow";
 
   @Macro
   @Nullable
@@ -112,13 +116,24 @@ public class FTPConfig extends PluginConfig implements FileSourceProperties {
 
   @Macro
   @Nullable
-  @Description("Whether to use first row as header. Supported formats are 'text', 'csv', 'tsv', " +
+  @Description("The maximum number of rows that will get investigated for automatic data type detection.")
+  private Long sampleSize;
+
+  @Macro
+  @Nullable
+  @Description("A list of columns with the corresponding data types for whom the automatic data type detection gets" +
+          " skipped.")
+  private String override;
+
+  @Macro
+  @Nullable
+  @Description("Whether to use first row as header. Supported formats are 'text', 'csv', 'tsv', 'xls', " +
     "'delimited'. Default value is false.")
   private final Boolean skipHeader;
 
   @Macro
   @Description("Format of the data to read. Supported formats are 'avro', 'blob', 'csv', 'delimited', 'json', "
-    + "'parquet', 'text', or 'tsv'. If no format is given, it will default to 'text'.")
+    + "'parquet', 'text', or 'tsv', 'xls'. If no format is given, it will default to 'text'.")
   private final String format;
 
   @Macro
@@ -149,6 +164,25 @@ public class FTPConfig extends PluginConfig implements FileSourceProperties {
   @Nullable
   @Description("Maximum time in milliseconds to wait for connection initialization before time out.")
   private final Integer connectTimeout;
+
+  @Name(NAME_SHEET)
+  @Macro
+  @Nullable
+  @Description("Select the sheet by name or number. Default is 'Sheet Number'.")
+  private String sheet;
+
+  @Name(NAME_SHEET_VALUE)
+  @Macro
+  @Nullable
+  @Description("The name/number of the sheet to read from. If not specified, the first sheet will be read." +
+          "Sheet Number are 0 based, ie first sheet is 0.")
+  private String sheetValue;
+
+  @Name(NAME_TERMINATE_IF_EMPTY_ROW)
+  @Macro
+  @Nullable
+  @Description("Specify whether to stop reading after encountering the first empty row. Defaults to false.")
+  private String terminateIfEmptyRow;
 
   @VisibleForTesting
   private FTPConfig(@Nullable String referenceName, String type, String host, @Nullable Integer port, String path,
