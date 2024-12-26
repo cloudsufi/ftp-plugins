@@ -23,6 +23,9 @@ import com.google.gson.Gson;
 import io.cdap.cdap.api.annotation.Description;
 import io.cdap.cdap.api.annotation.Macro;
 import io.cdap.cdap.api.data.schema.Schema;
+import io.cdap.cdap.api.exception.ErrorCategory;
+import io.cdap.cdap.api.exception.ErrorType;
+import io.cdap.cdap.api.exception.ErrorUtils;
 import io.cdap.cdap.api.plugin.PluginConfig;
 import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.plugin.common.batch.JobUtils;
@@ -340,7 +343,11 @@ public class FTPConfig extends PluginConfig implements FileSourceProperties {
     try {
       new URI(host);
     } catch (Exception e) {
-
+      String errorReason = String.format("Unable to create a new URI for host %s", host);
+      String errorMessage = String.format("Failed to create a new URi for host %s with reason %s.",
+        host, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
   }
 

@@ -15,6 +15,9 @@
  */
 package io.cdap.plugin.batch.source.ftp;
 
+import io.cdap.cdap.api.exception.ErrorCategory;
+import io.cdap.cdap.api.exception.ErrorType;
+import io.cdap.cdap.api.exception.ErrorUtils;
 import org.apache.commons.net.ftp.FTP;
 import org.apache.commons.net.ftp.FTPClient;
 import org.apache.commons.net.ftp.FTPFile;
@@ -77,7 +80,10 @@ public class FTPFileSystem extends FileSystem {
     String host = uri.getHost();
     host = (host == null) ? conf.get("fs.ftp.host", null) : host;
     if (host == null) {
-      throw new IOException("Invalid host specified");
+      String errorReason = "Invalid host specified";
+      String errorMessage = "Unable to initialize file system. Invalid host specified, host not found.";
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(errorReason));
     }
     conf.set("fs.ftp.host", host);
 
@@ -89,7 +95,10 @@ public class FTPFileSystem extends FileSystem {
     String user = conf.get("fs.ftp.user." + host, null);
     String password = conf.get("fs.ftp.password." + host, null);
     if (user == null) {
-      throw new IOException("No user specified");
+      String errorReason = "No user specified";
+      String errorMessage = "Unable to initialize file system. Invalid user specified, user not found.";
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(errorReason));
     }
 
     conf.set("fs.ftp.user." + host, user);
@@ -108,7 +117,7 @@ public class FTPFileSystem extends FileSystem {
    * @return An FTPClient instance
    * @throws IOException
    */
-  private FTPClient connect() throws IOException {
+  private FTPClient connect() {
     FTPClient client = null;
     Configuration conf = getConf();
     String host = conf.get("fs.ftp.host");
@@ -118,20 +127,27 @@ public class FTPFileSystem extends FileSystem {
     int connectTimeout = conf.getInt(FS_CONNECT_TIMEOUT, DEFAULT_CONNECTION_TIMEOUT_MS);
     client = new FTPClient();
     client.setConnectTimeout(connectTimeout);
-    client.connect(host, port);
-    int reply = client.getReplyCode();
-    if (!FTPReply.isPositiveCompletion(reply)) {
-      throw new IOException("Server - " + host
-                              + " refused connection on port - " + port);
-    } else if (client.login(user, password)) {
-      client.setFileTransferMode(FTP.BLOCK_TRANSFER_MODE);
-      client.setFileType(FTP.BINARY_FILE_TYPE);
-      client.setBufferSize(DEFAULT_BUFFER_SIZE);
-    } else {
-      throw new IOException("Login failed on server - " + host + ", port - "
-                              + port);
+    try {
+      client.connect(host, port);
+      int reply = client.getReplyCode();
+      if (!FTPReply.isPositiveCompletion(reply)) {
+        throw new IOException(String.format("Server:%s, refused connection on port: %s.", host, port));
+      } else {
+        if (client.login(user, password)) {
+          client.setFileTransferMode(FTP.BLOCK_TRANSFER_MODE);
+          client.setFileType(FTP.BINARY_FILE_TYPE);
+          client.setBufferSize(DEFAULT_BUFFER_SIZE);
+        } else {
+          throw new IOException(String.format("Login failed on server:%s, port: %s.", host, port));
+        }
+      }
+    } catch (IOException e) {
+      String errorReason = String.format("Error connecting with client on server: %s, on port: %s.", host, port);
+      String errorMessage = String.format("Error connecting with client on server: %s, on port: %s. " +
+        "Failure reason is %s.", host, port, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-
     return client;
   }
 
@@ -141,16 +157,23 @@ public class FTPFileSystem extends FileSystem {
    * @param client
    * @throws IOException
    */
-  private void disconnect(FTPClient client) throws IOException {
+  private void disconnect(FTPClient client) {
     if (client != null) {
       if (!client.isConnected()) {
         throw new FTPException("Client not connected");
       }
-      boolean logoutSuccess = client.logout();
-      client.disconnect();
-      if (!logoutSuccess) {
-        LOG.warn("Logout failed while disconnecting, error code - "
-                   + client.getReplyCode());
+      boolean logoutSuccess;
+      try {
+        logoutSuccess = client.logout();
+        client.disconnect();
+        if (!logoutSuccess) {
+          LOG.warn("Logout failed while disconnecting, error code: {}", client.getReplyCode());
+        }
+      } catch (IOException e) {
+        String errorReason = "Unable to log-out the client";
+        String errorMessage = String.format("Unable to  log-out the client. Failure reason is %s.", e.getMessage());
+        throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+          errorReason, errorMessage, ErrorType.SYSTEM, true, e);
       }
     }
   }
@@ -170,35 +193,44 @@ public class FTPFileSystem extends FileSystem {
   }
 
   @Override
-  public FSDataInputStream open(Path file, int bufferSize) throws IOException {
+  public FSDataInputStream open(Path file, int bufferSize) {
     FTPClient client = connect();
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absolute = makeAbsolute(workDir, file);
-    FileStatus fileStat = getFileStatus(client, absolute);
-    if (fileStat.isDirectory()) {
-      disconnect(client);
-      throw new IOException("Path " + file + " is a directory.");
+    Path workDir;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absolute = makeAbsolute(workDir, file);
+      FileStatus fileStat = getFileStatus(client, absolute);
+      if (fileStat.isDirectory()) {
+        disconnect(client);
+        throw new IOException("Path " + file + " is a directory.");
+      }
+      client.allocate(bufferSize);
+      Path parent = absolute.getParent();
+      // Change to parent directory on the
+      // server. Only then can we read the
+      // file
+      // on the server by opening up an InputStream. As a side effect the working
+      // directory on the server is changed to the parent directory of the file.
+      // The FTP client connection is closed when close() is called on the
+      // FSDataInputStream.
+      client.changeWorkingDirectory(parent.toUri().getPath());
+      InputStream is = client.retrieveFileStream(file.getName());
+      FSDataInputStream fis = new FSDataInputStream(new FTPInputStream(is,
+        client, statistics));
+      if (!FTPReply.isPositivePreliminary(client.getReplyCode())) {
+        // The ftpClient is an inconsistent state. Must close the stream
+        // which in turn will logout and disconnect from FTP server
+        fis.close();
+        throw new IOException("Unable to open file: " + file + ", Aborting");
+      }
+      return fis;
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to open file %s, aborting process.", file);
+      String errorMessage = String.format("Error opening file %s, aborting process. Failure reason is %s.",
+        file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    client.allocate(bufferSize);
-    Path parent = absolute.getParent();
-    // Change to parent directory on the
-    // server. Only then can we read the
-    // file
-    // on the server by opening up an InputStream. As a side effect the working
-    // directory on the server is changed to the parent directory of the file.
-    // The FTP client connection is closed when close() is called on the
-    // FSDataInputStream.
-    client.changeWorkingDirectory(parent.toUri().getPath());
-    InputStream is = client.retrieveFileStream(file.getName());
-    FSDataInputStream fis = new FSDataInputStream(new FTPInputStream(is,
-                                                                     client, statistics));
-    if (!FTPReply.isPositivePreliminary(client.getReplyCode())) {
-      // The ftpClient is an inconsistent state. Must close the stream
-      // which in turn will logout and disconnect from FTP server
-      fis.close();
-      throw new IOException("Unable to open file: " + file + ", Aborting");
-    }
-    return fis;
   }
 
   /**
@@ -208,55 +240,64 @@ public class FTPFileSystem extends FileSystem {
   @Override
   public FSDataOutputStream create(Path file, FsPermission permission,
                                    boolean overwrite, int bufferSize, short replication, long blockSize,
-                                   Progressable progress) throws IOException {
+                                   Progressable progress) {
     final FTPClient client = connect();
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absolute = makeAbsolute(workDir, file);
-    if (exists(client, file)) {
-      if (overwrite) {
-        delete(client, file);
-      } else {
-        disconnect(client);
-        throw new IOException("File already exists: " + file);
+    Path workDir;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absolute = makeAbsolute(workDir, file);
+      if (exists(client, file)) {
+        if (overwrite) {
+          delete(client, file);
+        } else {
+          disconnect(client);
+          throw new IOException("File already exists: " + file);
+        }
       }
-    }
 
-    Path parent = absolute.getParent();
-    if (parent == null || !mkdirs(client, parent, FsPermission.getDirDefault())) {
-      parent = (parent == null) ? new Path("/") : parent;
-      disconnect(client);
-      throw new IOException("create(): Mkdirs failed to create: " + parent);
-    }
-    client.allocate(bufferSize);
-    // Change to parent directory on the server. Only then can we write to the
-    // file on the server by opening up an OutputStream. As a side effect the
-    // working directory on the server is changed to the parent directory of the
-    // file. The FTP client connection is closed when close() is called on the
-    // FSDataOutputStream.
-    client.changeWorkingDirectory(parent.toUri().getPath());
-    FSDataOutputStream fos = new FSDataOutputStream(client.storeFileStream(file
-                                                                             .getName()), statistics) {
-      @Override
-      public void close() throws IOException {
-        super.close();
-        if (!client.isConnected()) {
-          throw new FTPException("Client not connected");
-        }
-        boolean cmdCompleted = client.completePendingCommand();
+      Path parent = absolute.getParent();
+      if (parent == null || !mkdirs(client, parent, FsPermission.getDirDefault())) {
+        parent = (parent == null) ? new Path("/") : parent;
         disconnect(client);
-        if (!cmdCompleted) {
-          throw new FTPException("Could not complete transfer, Reply Code - "
-                                   + client.getReplyCode());
-        }
+        throw new IOException("create(): Mkdirs failed to create: " + parent);
       }
-    };
-    if (!FTPReply.isPositivePreliminary(client.getReplyCode())) {
-      // The ftpClient is an inconsistent state. Must close the stream
-      // which in turn will logout and disconnect from FTP server
-      fos.close();
-      throw new IOException("Unable to create file: " + file + ", Aborting");
+      client.allocate(bufferSize);
+      // Change to parent directory on the server. Only then can we write to the
+      // file on the server by opening up an OutputStream. As a side effect the
+      // working directory on the server is changed to the parent directory of the
+      // file. The FTP client connection is closed when close() is called on the
+      // FSDataOutputStream.
+      client.changeWorkingDirectory(parent.toUri().getPath());
+      FSDataOutputStream fos = new FSDataOutputStream(client.storeFileStream(file
+        .getName()), statistics) {
+        @Override
+        public void close() throws IOException {
+          super.close();
+          if (!client.isConnected()) {
+            throw new FTPException("Client not connected");
+          }
+          boolean cmdCompleted = client.completePendingCommand();
+          disconnect(client);
+          if (!cmdCompleted) {
+            throw new FTPException("Could not complete transfer, Reply Code - "
+              + client.getReplyCode());
+          }
+        }
+      };
+      if (!FTPReply.isPositivePreliminary(client.getReplyCode())) {
+        // The ftpClient is an inconsistent state. Must close the stream
+        // which in turn will logout and disconnect from FTP server
+        fos.close();
+        throw new IOException("Unable to create file: " + file + ", Aborting");
+      }
+      return fos;
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to create file %s, aborting process.", file);
+      String errorMessage = String.format("Error creating file %s, aborting process. Failure reason is %s.",
+        file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    return fos;
   }
 
   /**
@@ -274,21 +315,14 @@ public class FTPFileSystem extends FileSystem {
    * the overhead of opening/closing a TCP connection.
    */
   private boolean exists(FTPClient client, Path file) {
-    try {
-      return getFileStatus(client, file) != null;
-    } catch (FileNotFoundException fnfe) {
-      return false;
-    } catch (IOException ioe) {
-      throw new FTPException("Failed to get file status", ioe);
-    }
+    return getFileStatus(client, file) != null;
   }
 
   @Override
   public boolean delete(Path file, boolean recursive) throws IOException {
     FTPClient client = connect();
     try {
-      boolean success = delete(client, file, recursive);
-      return success;
+      return delete(client, file, recursive);
     } finally {
       disconnect(client);
     }
@@ -298,7 +332,7 @@ public class FTPFileSystem extends FileSystem {
    * @deprecated Use delete(Path, boolean) instead
    */
   @Deprecated
-  private boolean delete(FTPClient client, Path file) throws IOException {
+  private boolean delete(FTPClient client, Path file) {
     return delete(client, file, false);
   }
 
@@ -307,25 +341,33 @@ public class FTPFileSystem extends FileSystem {
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
    */
-  private boolean delete(FTPClient client, Path file, boolean recursive)
-    throws IOException {
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absolute = makeAbsolute(workDir, file);
-    String pathName = absolute.toUri().getPath();
-    FileStatus fileStat = getFileStatus(client, absolute);
-    if (fileStat.isFile()) {
-      return client.deleteFile(pathName);
-    }
-    FileStatus[] dirEntries = listStatus(client, absolute);
-    if (dirEntries != null && dirEntries.length > 0 && !(recursive)) {
-      throw new IOException("Directory: " + file + " is not empty.");
-    }
-    if (dirEntries != null) {
-      for (int i = 0; i < dirEntries.length; i++) {
-        delete(client, new Path(absolute, dirEntries[i].getPath()), recursive);
+  private boolean delete(FTPClient client, Path file, boolean recursive) {
+    Path workDir;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absolute = makeAbsolute(workDir, file);
+      String pathName = absolute.toUri().getPath();
+      FileStatus fileStat = getFileStatus(client, absolute);
+      if (fileStat.isFile()) {
+        return client.deleteFile(pathName);
       }
+      FileStatus[] dirEntries = listStatus(client, absolute);
+      if (dirEntries.length > 0 && !recursive) {
+        throw new IOException("Directory: " + file + " is not empty.");
+      }
+      if (dirEntries != null) {
+        for (FileStatus dirEntry : dirEntries) {
+          delete(client, new Path(absolute, dirEntry.getPath()), recursive);
+        }
+      }
+      return client.removeDirectory(pathName);
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to delete file %s, aborting process.", file);
+      String errorMessage = String.format("Error deleting file %s, aborting process. " +
+        "Failure reason is %s.", file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    return client.removeDirectory(pathName);
   }
 
   private FsAction getFsAction(int accessGroup, FTPFile ftpFile) {
@@ -356,11 +398,10 @@ public class FTPFileSystem extends FileSystem {
   }
 
   @Override
-  public FileStatus[] listStatus(Path file) throws IOException {
+  public FileStatus[] listStatus(Path file) {
     FTPClient client = connect();
     try {
-      FileStatus[] stats = listStatus(client, file);
-      return stats;
+      return listStatus(client, file);
     } finally {
       disconnect(client);
     }
@@ -371,28 +412,35 @@ public class FTPFileSystem extends FileSystem {
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
    */
-  private FileStatus[] listStatus(FTPClient client, Path file)
-    throws IOException {
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absolute = makeAbsolute(workDir, file);
-    FileStatus fileStat = getFileStatus(client, absolute);
-    if (fileStat.isFile()) {
-      return new FileStatus[]{fileStat};
+  private FileStatus[] listStatus(FTPClient client, Path file) {
+    Path workDir = null;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absolute = makeAbsolute(workDir, file);
+      FileStatus fileStat = getFileStatus(client, absolute);
+      if (fileStat.isFile()) {
+        return new FileStatus[]{fileStat};
+      }
+      FTPFile[] ftpFiles = client.listFiles(absolute.toUri().getPath());
+      FileStatus[] fileStats = new FileStatus[ftpFiles.length];
+      for (int i = 0; i < ftpFiles.length; i++) {
+        fileStats[i] = getFileStatus(ftpFiles[i], absolute);
+      }
+      return fileStats;
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to fetch and list the status for file %s, aborting process.", file);
+      String errorMessage = String.format("Error fetching and listing status for file %s, aborting process. " +
+        "Failure reason is %s.", file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    FTPFile[] ftpFiles = client.listFiles(absolute.toUri().getPath());
-    FileStatus[] fileStats = new FileStatus[ftpFiles.length];
-    for (int i = 0; i < ftpFiles.length; i++) {
-      fileStats[i] = getFileStatus(ftpFiles[i], absolute);
-    }
-    return fileStats;
   }
 
   @Override
   public FileStatus getFileStatus(Path file) throws IOException {
     FTPClient client = connect();
     try {
-      FileStatus status = getFileStatus(client, file);
-      return status;
+      return getFileStatus(client, file);
     } finally {
       disconnect(client);
     }
@@ -403,38 +451,46 @@ public class FTPFileSystem extends FileSystem {
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
    */
-  private FileStatus getFileStatus(FTPClient client, Path file)
-    throws IOException {
+  private FileStatus getFileStatus(FTPClient client, Path file) {
     FileStatus fileStat = null;
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absolute = makeAbsolute(workDir, file);
-    Path parentPath = absolute.getParent();
-    if (parentPath == null) { // root dir
-      long length = -1; // Length of root dir on server not known
-      boolean isDir = true;
-      int blockReplication = 1;
-      long blockSize = DEFAULT_BLOCK_SIZE; // Block Size not known.
-      long modTime = -1; // Modification time of root dir not known.
-      Path root = new Path("/");
-      return new FileStatus(length, isDir, blockReplication, blockSize,
-                            modTime, root.makeQualified(this));
-    }
-    String pathName = parentPath.toUri().getPath();
-    FTPFile[] ftpFiles = client.listFiles(pathName);
-    if (ftpFiles != null) {
-      for (FTPFile ftpFile : ftpFiles) {
-        if (ftpFile.getName().equals(file.getName())) { // file found in dir
-          fileStat = getFileStatus(ftpFile, parentPath);
-          break;
-        }
+    Path workDir = null;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absolute = makeAbsolute(workDir, file);
+      Path parentPath = absolute.getParent();
+      if (parentPath == null) { // root dir
+        long length = -1; // Length of root dir on server not known
+        boolean isDir = true;
+        int blockReplication = 1;
+        long blockSize = DEFAULT_BLOCK_SIZE; // Block Size not known.
+        long modTime = -1; // Modification time of root dir not known.
+        Path root = new Path("/");
+        return new FileStatus(length, isDir, blockReplication, blockSize,
+          modTime, root.makeQualified(this));
       }
-      if (fileStat == null) {
+      String pathName = parentPath.toUri().getPath();
+      FTPFile[] ftpFiles = client.listFiles(pathName);
+      if (ftpFiles != null) {
+        for (FTPFile ftpFile : ftpFiles) {
+          if (ftpFile.getName().equals(file.getName())) { // file found in dir
+            fileStat = getFileStatus(ftpFile, parentPath);
+            break;
+          }
+        }
+        if (fileStat == null) {
+          throw new FileNotFoundException("File " + file + " does not exist.");
+        }
+      } else {
         throw new FileNotFoundException("File " + file + " does not exist.");
       }
-    } else {
-      throw new FileNotFoundException("File " + file + " does not exist.");
+      return fileStat;
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to fetch the status for file %s, aborting process.", file);
+      String errorMessage = String.format("Error fetching status for file %s, aborting process. " +
+        "Failure reason is %s.", file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    return fileStat;
   }
 
   /**
@@ -462,11 +518,10 @@ public class FTPFileSystem extends FileSystem {
   }
 
   @Override
-  public boolean mkdirs(Path file, FsPermission permission) throws IOException {
+  public boolean mkdirs(Path file, FsPermission permission) {
     FTPClient client = connect();
     try {
-      boolean success = mkdirs(client, file, permission);
-      return success;
+      return mkdirs(client, file, permission);
     } finally {
       disconnect(client);
     }
@@ -477,26 +532,33 @@ public class FTPFileSystem extends FileSystem {
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
    */
-  private boolean mkdirs(FTPClient client, Path file, FsPermission permission)
-    throws IOException {
+  private boolean mkdirs(FTPClient client, Path file, FsPermission permission) {
     boolean created = true;
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absolute = makeAbsolute(workDir, file);
-    String pathName = absolute.getName();
-    if (!exists(client, absolute)) {
-      Path parent = absolute.getParent();
-      created = (parent == null || mkdirs(client, parent, FsPermission
-        .getDirDefault()));
-      if (created) {
-        String parentDir = parent.toUri().getPath();
-        client.changeWorkingDirectory(parentDir);
-        created = created && client.makeDirectory(pathName);
+    Path workDir;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absolute = makeAbsolute(workDir, file);
+      String pathName = absolute.getName();
+      if (!exists(client, absolute)) {
+        Path parent = absolute.getParent();
+        created = (parent == null || mkdirs(client, parent, FsPermission
+          .getDirDefault()));
+        if (created) {
+          String parentDir = parent.toUri().getPath();
+          client.changeWorkingDirectory(parentDir);
+          created = created && client.makeDirectory(pathName);
+        }
+      } else if (isFile(client, absolute)) {
+        throw new IOException(String.format("Can't make directory for path %s since it is a file.", absolute));
       }
-    } else if (isFile(client, absolute)) {
-      throw new IOException(String.format(
-        "Can't make directory for path %s since it is a file.", absolute));
+      return created;
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to make directory for file %s, aborting process.", file);
+      String errorMessage = String.format("Error making directory for file %s, aborting process. " +
+        "Failure reason is %s.", file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    return created;
   }
 
   /**
@@ -505,13 +567,7 @@ public class FTPFileSystem extends FileSystem {
    * the overhead of opening/closing a TCP connection.
    */
   private boolean isFile(FTPClient client, Path file) {
-    try {
-      return getFileStatus(client, file).isFile();
-    } catch (FileNotFoundException e) {
-      return false; // file does not exist
-    } catch (IOException ioe) {
-      throw new FTPException("File check failed", ioe);
-    }
+    return getFileStatus(client, file).isFile();
   }
 
   /*
@@ -522,8 +578,7 @@ public class FTPFileSystem extends FileSystem {
   public boolean rename(Path src, Path dst) throws IOException {
     FTPClient client = connect();
     try {
-      boolean success = rename(client, src, dst);
-      return success;
+      return rename(client, src, dst);
     } finally {
       disconnect(client);
     }
@@ -540,29 +595,38 @@ public class FTPFileSystem extends FileSystem {
    * @return
    * @throws IOException
    */
-  private boolean rename(FTPClient client, Path src, Path dst)
-    throws IOException {
-    Path workDir = new Path(client.printWorkingDirectory());
-    Path absoluteSrc = makeAbsolute(workDir, src);
-    Path absoluteDst = makeAbsolute(workDir, dst);
-    if (!exists(client, absoluteSrc)) {
-      throw new IOException("Source path " + src + " does not exist");
+  private boolean rename(FTPClient client, Path src, Path dst) {
+    Path workDir;
+    try {
+      workDir = new Path(client.printWorkingDirectory());
+      Path absoluteSrc = makeAbsolute(workDir, src);
+      Path absoluteDst = makeAbsolute(workDir, dst);
+      if (!exists(client, absoluteSrc)) {
+        throw new IOException("Source path " + src + " does not exist");
+      }
+      if (exists(client, absoluteDst)) {
+        throw new IOException("Destination path " + dst
+          + " already exist, cannot rename!");
+      }
+      String parentSrc = absoluteSrc.getParent().toUri().toString();
+      String parentDst = absoluteDst.getParent().toUri().toString();
+      String from = src.getName();
+      String to = dst.getName();
+      if (!parentSrc.equals(parentDst)) {
+        throw new IOException("Cannot rename parent(source): " + parentSrc
+          + ", parent(destination):  " + parentDst);
+      }
+      client.changeWorkingDirectory(parentSrc);
+      return client.rename(from, to);
+    } catch (IOException e) {
+      String errorReason = String.format("Unable to rename the source path %s as destination path %s already exist, " +
+        "aborting process.", src, dst);
+      String errorMessage = String.format("Error rename the source path %s as destination path %s already exist, " +
+        "aborting process. Failure reason is %s.", src, dst, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
-    if (exists(client, absoluteDst)) {
-      throw new IOException("Destination path " + dst
-                              + " already exist, cannot rename!");
-    }
-    String parentSrc = absoluteSrc.getParent().toUri().toString();
-    String parentDst = absoluteDst.getParent().toUri().toString();
-    String from = src.getName();
-    String to = dst.getName();
-    if (!parentSrc.equals(parentDst)) {
-      throw new IOException("Cannot rename parent(source): " + parentSrc
-                              + ", parent(destination):  " + parentDst);
-    }
-    client.changeWorkingDirectory(parentSrc);
-    boolean renamed = client.rename(from, to);
-    return renamed;
+
   }
 
   @Override
@@ -576,16 +640,11 @@ public class FTPFileSystem extends FileSystem {
     FTPClient client = null;
     try {
       client = connect();
-      Path homeDir = new Path(client.printWorkingDirectory());
-      return homeDir;
+      return new Path(client.printWorkingDirectory());
     } catch (IOException ioe) {
       throw new FTPException("Failed to get home directory", ioe);
     } finally {
-      try {
-        disconnect(client);
-      } catch (IOException ioe) {
-        throw new FTPException("Failed to disconnect", ioe);
-      }
+      disconnect(client);
     }
   }
 

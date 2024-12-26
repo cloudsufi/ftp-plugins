@@ -21,6 +21,9 @@ import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.ChannelSftp.LsEntry;
 import com.jcraft.jsch.SftpATTRS;
 import com.jcraft.jsch.SftpException;
+import io.cdap.cdap.api.exception.ErrorCategory;
+import io.cdap.cdap.api.exception.ErrorType;
+import io.cdap.cdap.api.exception.ErrorUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
@@ -29,11 +32,13 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.util.Progressable;
+import org.apache.hadoop.util.StringUtils;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UnsupportedEncodingException;
 import java.net.URI;
 import java.net.URLDecoder;
 import java.util.ArrayList;
@@ -94,53 +99,64 @@ public class SFTPFileSystem extends FileSystem {
    * @param conf
    * @throws IOException
    */
-  private void setConfigurationFromURI(URI uriInfo, Configuration conf)
-    throws IOException {
-
-    // get host information from URI
-    String host = uriInfo.getHost();
-    host = (host == null) ? conf.get(FS_SFTP_HOST, null) : host;
-    if (host == null) {
-      throw new IOException(E_HOST_NULL);
-    }
-    conf.set(FS_SFTP_HOST, host);
-
-    int port = uriInfo.getPort();
-    port = (port == -1)
-      ? conf.getInt(FS_SFTP_HOST_PORT, DEFAULT_SFTP_PORT)
-      : port;
-    conf.setInt(FS_SFTP_HOST_PORT, port);
-
-    // get user/password information from URI
-    String userAndPwdFromUri = uriInfo.getUserInfo();
-    if (userAndPwdFromUri != null) {
-      String[] userPasswdInfo = userAndPwdFromUri.split(":");
-      String user = userPasswdInfo[0];
-      user = URLDecoder.decode(user, "UTF-8");
-      conf.set(FS_SFTP_USER_PREFIX + host, user);
-      if (userPasswdInfo.length > 1) {
-        conf.set(FS_SFTP_PASSWORD_PREFIX + host + "." +
-                   user, userPasswdInfo[1]);
+  private void setConfigurationFromURI(URI uriInfo, Configuration conf) {
+    try {
+      // get host information from URI
+      String host = uriInfo.getHost();
+      host = (host == null) ? conf.get(FS_SFTP_HOST, null) : host;
+      if (host == null) {
+        throw new IOException(E_HOST_NULL);
       }
-    }
+      conf.set(FS_SFTP_HOST, host);
 
-    String user = conf.get(FS_SFTP_USER_PREFIX + host);
-    if (user == null || user.equals("")) {
-      throw new IllegalStateException(E_USER_NULL);
-    }
+      int port = uriInfo.getPort();
+      port = (port == -1)
+        ? conf.getInt(FS_SFTP_HOST_PORT, DEFAULT_SFTP_PORT)
+        : port;
+      conf.setInt(FS_SFTP_HOST_PORT, port);
 
-    int connectionMax =
-      conf.getInt(FS_SFTP_CONNECTION_MAX, DEFAULT_MAX_CONNECTION);
-    connectionPool = new SFTPConnectionPool(connectionMax);
+      // get user/password information from URI
+      String userAndPwdFromUri = uriInfo.getUserInfo();
+      if (userAndPwdFromUri != null) {
+        String[] userPasswdInfo = userAndPwdFromUri.split(":");
+        String user = userPasswdInfo[0];
+        user = URLDecoder.decode(user, "UTF-8");
+        conf.set(FS_SFTP_USER_PREFIX + host, user);
+        if (userPasswdInfo.length > 1) {
+          conf.set(FS_SFTP_PASSWORD_PREFIX + host + "." +
+            user, userPasswdInfo[1]);
+        }
+      }
+
+      String user = conf.get(FS_SFTP_USER_PREFIX + host);
+      if (user == null || user.isEmpty()) {
+        throw new IllegalStateException(E_USER_NULL);
+      }
+      int connectionMax = conf.getInt(FS_SFTP_CONNECTION_MAX, DEFAULT_MAX_CONNECTION);
+      connectionPool = new SFTPConnectionPool(connectionMax);
+    } catch (UnsupportedEncodingException e) {
+      String errorReason = String.format("Failed to decode the information from provided URI for host %s.",
+        uriInfo.getHost());
+      String errorMessage = String.format("Failed to decode the information from provided URI for host %s. " +
+        "Failure reason is %s.", uriInfo.getHost(), e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
+    } catch (IOException e) {
+      String errorReason = String.format("Error setting configuration properties from the URI for host %s",
+        uriInfo.getHost());
+      String errorMessage = String.format("Error setting configuration properties from the URI for host %s. " +
+        "Failure reason is %s.", uriInfo.getHost(), e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
+    }
   }
 
   /**
    * Connecting by using configuration parameters.
    *
    * @return An FTPClient instance
-   * @throws IOException
    */
-  private ChannelSftp connect() throws IOException {
+  private ChannelSftp connect() {
     Configuration conf = getConf();
 
     String host = conf.get(FS_SFTP_HOST, null);
@@ -150,10 +166,7 @@ public class SFTPFileSystem extends FileSystem {
     String keyFile = conf.get(FS_SFTP_KEYFILE, null);
     int connectTimeout = conf.getInt(FS_CONNECT_TIMEOUT, DEFAULT_CONNECTION_TIMEOUT_MS);
 
-    ChannelSftp channel =
-      connectionPool.connect(host, port, user, pwd, keyFile, connectTimeout);
-
-    return channel;
+    return connectionPool.connect(host, port, user, pwd, keyFile, connectTimeout);
   }
 
   /**
@@ -162,7 +175,7 @@ public class SFTPFileSystem extends FileSystem {
    * @param channel
    * @throws IOException
    */
-  private void disconnect(ChannelSftp channel) throws IOException {
+  private void disconnect(ChannelSftp channel) {
     connectionPool.disconnect(channel);
   }
 
@@ -184,17 +197,10 @@ public class SFTPFileSystem extends FileSystem {
    * Convenience method, so that we don't open a new connection when using this
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
-   * @throws IOException
    */
-  private boolean exists(ChannelSftp channel, Path file) throws IOException {
-    try {
-      getFileStatus(channel, file);
-      return true;
-    } catch (FileNotFoundException fnfe) {
-      return false;
-    } catch (IOException ioe) {
-      throw new IOException(E_FILE_STATUS, ioe);
-    }
+  private boolean exists(ChannelSftp channel, Path file) {
+    FileStatus fileStatus = getFileStatus(channel, file);
+    return fileStatus != null;
   }
 
   /**
@@ -203,14 +209,17 @@ public class SFTPFileSystem extends FileSystem {
    * the overhead of opening/closing a TCP connection.
    */
   @SuppressWarnings("unchecked")
-  private FileStatus getFileStatus(ChannelSftp client, Path file)
-    throws IOException {
+  private FileStatus getFileStatus(ChannelSftp client, Path file) {
     FileStatus fileStat = null;
     Path workDir;
     try {
       workDir = new Path(client.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = String.format("Error creating path for file '%s'.", file);
+      String errorMessage = String.format("Error creating path for file '%s'. Failure reason is %s.",
+        file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absolute = makeAbsolute(workDir, file);
     Path parentPath = absolute.getParent();
@@ -226,11 +235,12 @@ public class SFTPFileSystem extends FileSystem {
                             root.makeQualified(this.getUri(), this.getWorkingDirectory()));
     }
     String pathName = parentPath.toUri().getPath();
-    Vector<LsEntry> sftpFiles;
+    Vector<LsEntry> sftpFiles = new Vector<>();
     try {
       sftpFiles = (Vector<LsEntry>) client.ls(pathName);
     } catch (SftpException e) {
-      throw new FileNotFoundException(String.format(E_FILE_NOTFOUND, file));
+      fileNotFoundException(file, String.format("File '%s' does not exist. Failure reason is %s.",
+        file, e.getMessage()));
     }
     if (sftpFiles != null) {
       for (LsEntry sftpFile : sftpFiles) {
@@ -241,12 +251,19 @@ public class SFTPFileSystem extends FileSystem {
         }
       }
       if (fileStat == null) {
-        throw new FileNotFoundException(String.format(E_FILE_NOTFOUND, file));
+        fileNotFoundException(file, String.format("File not found. File '%s' does not exist.", file));
       }
     } else {
-      throw new FileNotFoundException(String.format(E_FILE_NOTFOUND, file));
+      fileNotFoundException(file, String.format("File '%s' does not exist.", file));
     }
     return fileStat;
+  }
+
+  private static void fileNotFoundException(Path file, String errorMessage) {
+    String errorReason = String.format("File '%s' does not exist.", file);
+    throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+      errorReason, errorMessage, ErrorType.SYSTEM, true,
+      new FileNotFoundException(String.format(E_FILE_NOTFOUND, file)));
   }
 
   /**
@@ -258,7 +275,7 @@ public class SFTPFileSystem extends FileSystem {
    * @throws IOException
    */
   private FileStatus getFileStatus(ChannelSftp channel, LsEntry sftpFile,
-                                   Path parentPath) throws IOException {
+                                   Path parentPath) {
 
     SftpATTRS attr = sftpFile.getAttrs();
     long length = attr.getSize();
@@ -275,14 +292,17 @@ public class SFTPFileSystem extends FileSystem {
         isDir = fstat.isDirectory();
         length = fstat.getLen();
       } catch (Exception e) {
-        throw new IOException(e);
+        String errorReason = String.format("Unable to fetch status for at path %s.", parentPath);
+        String errorMessage = String.format("Unable to fetch status at path %s. " +
+          "Failure reason is %s.", parentPath, e.getMessage());
+        throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+          errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
       }
     }
     int blockReplication = 1;
     // Using default block size since there is no way in SFTP channel to know of
     // block sizes on server. The assumption could be less than ideal.
-    long blockSize = DEFAULT_BLOCK_SIZE;
-    long modTime = attr.getMTime() * 1000; // convert to milliseconds
+    long modTime = attr.getMTime() * 1000L; // convert to milliseconds
     long accessTime = 0;
     FsPermission permission = getPermissions(sftpFile);
     // not be able to get the real user group name, just use the user and group
@@ -291,7 +311,7 @@ public class SFTPFileSystem extends FileSystem {
     String group = Integer.toString(attr.getGId());
     Path filePath = new Path(parentPath, sftpFile.getFilename());
 
-    return new FileStatus(length, isDir, blockReplication, blockSize, modTime,
+    return new FileStatus(length, isDir, blockReplication, DEFAULT_BLOCK_SIZE, modTime,
                           accessTime, permission, user, group, filePath.makeQualified(
       this.getUri(), this.getWorkingDirectory()));
   }
@@ -311,14 +331,16 @@ public class SFTPFileSystem extends FileSystem {
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
    */
-  private boolean mkdirs(ChannelSftp client, Path file, FsPermission permission)
-    throws IOException {
+  private boolean mkdirs(ChannelSftp client, Path file, FsPermission permission) {
     boolean created = true;
     Path workDir;
     try {
       workDir = new Path(client.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = "Unable to construct a new path";
+      String errorMessage = String.format("Error creating a new path. Failure reason is %s.", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absolute = makeAbsolute(workDir, file);
     String pathName = absolute.getName();
@@ -333,13 +355,26 @@ public class SFTPFileSystem extends FileSystem {
           client.cd(parentDir);
           client.mkdir(pathName);
         } catch (SftpException e) {
-          throw new IOException(String.format(E_MAKE_DIR_FORPATH, pathName,
-                                              parentDir));
+          String errorReason = String.format("Unable to make directory at path %s.", file);
+          String errorMessage = String.format("Unable to make directory at path %s. " +
+            "Failure reason is %s.", file, e.getMessage());
+          throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+            errorReason, errorMessage, ErrorType.SYSTEM, true,
+            new IOException(String.format(E_MAKE_DIR_FORPATH, pathName, parentDir)));
         }
         created = created & succeeded;
       }
-    } else if (isFile(client, absolute)) {
-      throw new IOException(String.format(E_DIR_CREATE_FROMFILE, absolute));
+    } else {
+      try {
+        if (isFile(client, absolute)) {
+          throw new IOException(String.format(E_DIR_CREATE_FROMFILE, absolute));
+        }
+      } catch (IOException e) {
+        String errorReason = String.format(E_DIR_CREATE_FROMFILE, file);
+        String errorMessage = String.format(E_DIR_CREATE_FROMFILE + "Failure reason is %s.", file, e.getMessage());
+        throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+          errorReason, errorMessage, ErrorType.SYSTEM, true, e);
+      }
     }
     return created;
   }
@@ -350,14 +385,8 @@ public class SFTPFileSystem extends FileSystem {
    * the overhead of opening/closing a TCP connection.
    * @throws IOException
    */
-  private boolean isFile(ChannelSftp channel, Path file) throws IOException {
-    try {
-      return !getFileStatus(channel, file).isDirectory();
-    } catch (FileNotFoundException e) {
-      return false; // file does not exist
-    } catch (IOException ioe) {
-      throw new IOException(E_FILE_CHECK_FAILED, ioe);
-    }
+  private boolean isFile(ChannelSftp channel, Path file) {
+    return !getFileStatus(channel, file).isDirectory();
   }
 
   /**
@@ -365,23 +394,20 @@ public class SFTPFileSystem extends FileSystem {
    * method from within another method. Otherwise every API invocation incurs
    * the overhead of opening/closing a TCP connection.
    */
-  private boolean delete(ChannelSftp channel, Path file, boolean recursive)
-    throws IOException {
+  private boolean delete(ChannelSftp channel, Path file, boolean recursive) {
     Path workDir;
     try {
       workDir = new Path(channel.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = "Error deleting. Unable to construct a new path.";
+      String errorMessage = String.format("Error deleting. Unable to construct a new path." +
+        "Failure reason is %s.", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absolute = makeAbsolute(workDir, file);
     String pathName = absolute.toUri().getPath();
-    FileStatus fileStat = null;
-    try {
-      fileStat = getFileStatus(channel, absolute);
-    } catch (FileNotFoundException e) {
-      // file not found, no need to delete, return true
-      return false;
-    }
+    FileStatus fileStat = getFileStatus(channel, absolute);
     if (!fileStat.isDirectory()) {
       boolean status = true;
       try {
@@ -392,16 +418,25 @@ public class SFTPFileSystem extends FileSystem {
       return status;
     } else {
       boolean status = true;
-      FileStatus[] dirEntries = listStatus(channel, absolute);
-      if (dirEntries != null && dirEntries.length > 0) {
-        if (!recursive) {
-          throw new IOException(String.format(E_DIR_NOTEMPTY, file));
+      FileStatus[] dirEntries;
+      try {
+        dirEntries = listStatus(channel, absolute);
+        if (dirEntries.length > 0) {
+          if (!recursive) {
+            throw new IOException(String.format(E_DIR_NOTEMPTY, file));
+          }
+          for (FileStatus dirEntry : dirEntries) {
+            delete(channel, new Path(absolute, dirEntry.getPath()), recursive);
+          }
         }
-        for (int i = 0; i < dirEntries.length; ++i) {
-          delete(channel, new Path(absolute, dirEntries[i].getPath()),
-                 recursive);
-        }
+      } catch (IOException e) {
+        String errorReason = String.format("Error deleting. Unable to fetch directory entries for path %s", file);
+        String errorMessage = String.format("Error deleting. Unable to fetch directory entries for path %s." +
+          "Failure reason is %s.", file, e.getMessage());
+        throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+          errorReason, errorMessage, ErrorType.SYSTEM, true, e);
       }
+
       try {
         channel.rmdir(pathName);
       } catch (SftpException e) {
@@ -417,13 +452,16 @@ public class SFTPFileSystem extends FileSystem {
    * the overhead of opening/closing a TCP connection.
    */
   @SuppressWarnings("unchecked")
-  private FileStatus[] listStatus(ChannelSftp client, Path file)
-    throws IOException {
+  private FileStatus[] listStatus(ChannelSftp client, Path file) {
     Path workDir;
     try {
       workDir = new Path(client.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = "Error checking file status. Unable to construct new path.";
+      String errorMessage = String.format("Error checking file status. Unable to construct new path. " +
+        "Failure reason is %s.", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absolute = makeAbsolute(workDir, file);
     FileStatus fileStat = getFileStatus(client, absolute);
@@ -432,13 +470,16 @@ public class SFTPFileSystem extends FileSystem {
     }
     Vector<LsEntry> sftpFiles;
     try {
-      sftpFiles = (Vector<LsEntry>) client.ls(absolute.toUri().getPath());
+      sftpFiles = client.ls(absolute.toUri().getPath());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = String.format("Error checking and listing the files due to invalid path '%s'", file);
+      String errorMessage = String.format("Error checking and listing the files due to invalid path '%s'" +
+        "Failure reason is %s.", file, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
-    ArrayList<FileStatus> fileStats = new ArrayList<FileStatus>();
-    for (int i = 0; i < sftpFiles.size(); i++) {
-      LsEntry entry = sftpFiles.get(i);
+    ArrayList<FileStatus> fileStats = new ArrayList<>();
+    for (LsEntry entry : sftpFiles) {
       String fname = entry.getFilename();
       // skip current and parent directory, ie. "." and ".."
       if (!".".equalsIgnoreCase(fname) && !"..".equalsIgnoreCase(fname)) {
@@ -459,22 +500,30 @@ public class SFTPFileSystem extends FileSystem {
    * @return rename successful?
    * @throws IOException
    */
-  private boolean rename(ChannelSftp channel, Path src, Path dst)
-    throws IOException {
+  private boolean rename(ChannelSftp channel, Path src, Path dst) {
     Path workDir;
     try {
       workDir = new Path(channel.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = String.format("Error creating a new work directory at '%s'", src);
+      String errorMessage = String.format("Error creating a new work directory at '%s'. Failure reason is %s.",
+        src, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absoluteSrc = makeAbsolute(workDir, src);
     Path absoluteDst = makeAbsolute(workDir, dst);
 
     if (!exists(channel, absoluteSrc)) {
-      throw new IOException(String.format(E_SPATH_NOTEXIST, src));
+      String errorReason = String.format("Failed to validate source path '%s' does not exist.", absoluteSrc);
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorReason, ErrorType.SYSTEM, true, new IOException(String.format(E_SPATH_NOTEXIST, src)));
     }
     if (exists(channel, absoluteDst)) {
-      throw new IOException(String.format(E_DPATH_EXIST, dst));
+      String errorReason = String.format("Failed to rename as destination pth %s already exist.",
+        absoluteDst);
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorReason, ErrorType.SYSTEM, true, new IOException(String.format(E_DPATH_EXIST, dst)));
     }
     boolean renamed = true;
     try {
@@ -506,19 +555,26 @@ public class SFTPFileSystem extends FileSystem {
   }
 
   @Override
-  public FSDataInputStream open(Path f, int bufferSize) throws IOException {
+  public FSDataInputStream open(Path f, int bufferSize) {
     ChannelSftp channel = connect();
     Path workDir;
     try {
       workDir = new Path(channel.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = String.format("Error accessing work directory at '%s'", f);
+      String errorMessage = String.format("Error accessing work directory at '%s'. Failure reason is %s.",
+        f, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absolute = makeAbsolute(workDir, f);
     FileStatus fileStat = getFileStatus(channel, absolute);
     if (fileStat.isDirectory()) {
       disconnect(channel);
-      throw new IOException(String.format(E_PATH_DIR, f));
+      String errorReason = String.format(E_PATH_DIR, f);
+      String errorMessage = String.format("Unable to fetch file status, since '%s' a directory.", f);
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(errorReason));
     }
     InputStream is;
     try {
@@ -527,12 +583,14 @@ public class SFTPFileSystem extends FileSystem {
 
       is = channel.get(absolute.toUri().getPath());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = "Unable to read path, it could be a link. Please provide the actual path.";
+      String errorMessage = String.format("Unable to read path %s, it could be a link. Failures reason is %s",
+        f, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.USER, true, new IOException(e));
     }
 
-    FSDataInputStream fis =
-      new FSDataInputStream(new SFTPInputStream(is, channel, statistics));
-    return fis;
+    return new FSDataInputStream(new SFTPInputStream(is, channel, statistics));
   }
 
   /**
@@ -542,13 +600,17 @@ public class SFTPFileSystem extends FileSystem {
   @Override
   public FSDataOutputStream create(Path f, FsPermission permission,
                                    boolean overwrite, int bufferSize, short replication, long blockSize,
-                                   Progressable progress) throws IOException {
+                                   Progressable progress) {
     final ChannelSftp client = connect();
     Path workDir;
     try {
       workDir = new Path(client.pwd());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = "Error creating, unable to create a work directory.";
+      String errorMessage = String.format("Error creating, unable to create a work directory. Failure reason is %s.",
+        e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
     Path absolute = makeAbsolute(workDir, f);
     if (exists(client, f)) {
@@ -556,31 +618,39 @@ public class SFTPFileSystem extends FileSystem {
         delete(client, f, false);
       } else {
         disconnect(client);
-        throw new IOException(String.format(E_FILE_EXIST, f));
+        String errorReason = String.format(E_FILE_EXIST, f);
+        String errorMessage = String.format("Error creating, file %s already exist. Unable to overwrite.", f);
+        throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+          errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(errorReason));
       }
     }
     Path parent = absolute.getParent();
     if (parent == null || !mkdirs(client, parent, FsPermission.getDefault())) {
       parent = (parent == null) ? new Path("/") : parent;
       disconnect(client);
-      throw new IOException(String.format(E_CREATE_DIR, parent));
+      String errorReason = String.format(E_CREATE_DIR, parent);
+      String errorMessage = String.format("Error creating, unable to create MkDirs %s", absolute);
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(errorReason));
     }
     OutputStream os;
     try {
       client.cd(parent.toUri().getPath());
       os = client.put(f.getName());
     } catch (SftpException e) {
-      throw new IOException(e);
+      String errorReason = String.format("Unable to change directory to %s", parent.toUri().getPath());
+      String errorMessage = String.format("Unable to change directory to '%s'. Failure reason is %s.",
+        parent.toUri().getPath(), e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(e));
     }
-    FSDataOutputStream fos = new FSDataOutputStream(os, statistics) {
+    return new FSDataOutputStream(os, statistics) {
       @Override
       public void close() throws IOException {
         super.close();
         disconnect(client);
       }
     };
-
-    return fos;
   }
 
   @Override
@@ -595,33 +665,30 @@ public class SFTPFileSystem extends FileSystem {
    * work like 'move'
    */
   @Override
-  public boolean rename(Path src, Path dst) throws IOException {
+  public boolean rename(Path src, Path dst) {
     ChannelSftp channel = connect();
     try {
-      boolean success = rename(channel, src, dst);
-      return success;
+      return rename(channel, src, dst);
     } finally {
       disconnect(channel);
     }
   }
 
   @Override
-  public boolean delete(Path f, boolean recursive) throws IOException {
+  public boolean delete(Path f, boolean recursive) {
     ChannelSftp channel = connect();
     try {
-      boolean success = delete(channel, f, recursive);
-      return success;
+      return delete(channel, f, recursive);
     } finally {
       disconnect(channel);
     }
   }
 
   @Override
-  public FileStatus[] listStatus(Path f) throws IOException {
+  public FileStatus[] listStatus(Path f) {
     ChannelSftp client = connect();
     try {
-      FileStatus[] stats = listStatus(client, f);
-      return stats;
+      return listStatus(client, f);
     } finally {
       disconnect(client);
     }
@@ -643,36 +710,29 @@ public class SFTPFileSystem extends FileSystem {
     ChannelSftp channel = null;
     try {
       channel = connect();
-      Path homeDir = new Path(channel.pwd());
-      return homeDir;
+      return new Path(channel.pwd());
     } catch (Exception ioe) {
       return null;
     } finally {
-      try {
-        disconnect(channel);
-      } catch (IOException ioe) {
-        return null;
-      }
+      disconnect(channel);
     }
   }
 
   @Override
-  public boolean mkdirs(Path f, FsPermission permission) throws IOException {
+  public boolean mkdirs(Path f, FsPermission permission) {
     ChannelSftp client = connect();
     try {
-      boolean success = mkdirs(client, f, permission);
-      return success;
+      return mkdirs(client, f, permission);
     } finally {
       disconnect(client);
     }
   }
 
   @Override
-  public FileStatus getFileStatus(Path f) throws IOException {
+  public FileStatus getFileStatus(Path f) {
     ChannelSftp channel = connect();
     try {
-      FileStatus status = getFileStatus(channel, f);
-      return status;
+      return getFileStatus(channel, f);
     } finally {
       disconnect(channel);
     }
