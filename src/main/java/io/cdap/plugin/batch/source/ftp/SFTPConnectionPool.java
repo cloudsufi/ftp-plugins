@@ -21,6 +21,9 @@ import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSch;
 import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
+import io.cdap.cdap.api.exception.ErrorCategory;
+import io.cdap.cdap.api.exception.ErrorType;
+import io.cdap.cdap.api.exception.ErrorUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,21 +53,29 @@ class SFTPConnectionPool {
     this.maxConnection = maxConnection;
   }
 
-  synchronized ChannelSftp getFromPool(ConnectionInfo info) throws IOException {
-    Set<ChannelSftp> cons = idleConnections.get(info);
-    ChannelSftp channel;
+  synchronized ChannelSftp getFromPool(ConnectionInfo info) {
+    try {
+      Set<ChannelSftp> cons = idleConnections.get(info);
+      ChannelSftp channel;
 
-    if (cons != null && cons.size() > 0) {
-      Iterator<ChannelSftp> it = cons.iterator();
-      if (it.hasNext()) {
-        channel = it.next();
-        idleConnections.remove(info);
-        return channel;
-      } else {
-        throw new IOException("Connection pool error.");
+      if (cons != null && !cons.isEmpty()) {
+        Iterator<ChannelSftp> it = cons.iterator();
+        if (it.hasNext()) {
+          channel = it.next();
+          idleConnections.remove(info);
+          return channel;
+        } else {
+          throw new IOException("Connection pool error.");
+        }
       }
+      return null;
+    } catch (IOException e) {
+      String errorReason = "Unable to fetch connections.";
+      String errorMessage = String.format("Unable to fetch connections, aborting process. Failure reason is %s.",
+        e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.UNKNOWN, true, e);
     }
-    return null;
   }
 
   /** Add the channel into pool.
@@ -74,7 +85,7 @@ class SFTPConnectionPool {
     ConnectionInfo info = con2infoMap.get(channel);
     HashSet<ChannelSftp> cons = idleConnections.get(info);
     if (cons == null) {
-      cons = new HashSet<ChannelSftp>();
+      cons = new HashSet<>();
       idleConnections.put(info, cons);
     }
     cons.add(channel);
@@ -86,23 +97,16 @@ class SFTPConnectionPool {
     if (this.con2infoMap == null) {
       return; // already shutdown in case it is called
     }
-    LOG.info("Inside shutdown, con2infoMap size=" + con2infoMap.size());
+    LOG.info("Inside shutdown, con2infoMap size= {}", con2infoMap.size());
 
     this.maxConnection = 0;
     Set<ChannelSftp> cons = con2infoMap.keySet();
-    if (cons != null && cons.size() > 0) {
+    if (!cons.isEmpty()) {
       // make a copy since we need to modify the underlying Map
       Set<ChannelSftp> copy = new HashSet<ChannelSftp>(cons);
       // Initiate disconnect from all outstanding connections
       for (ChannelSftp con : copy) {
-        try {
-          disconnect(con);
-        } catch (IOException ioe) {
-          ConnectionInfo info = con2infoMap.get(con);
-          LOG.error(
-            "Error encountered while closing connection to " + info.getHost(),
-            ioe);
-        }
+        disconnect(con);
       }
     }
     // make sure no further connections can be returned.
@@ -119,7 +123,7 @@ class SFTPConnectionPool {
   }
 
   public ChannelSftp connect(String host, int port, String user,
-                             String password, String keyFile, int timeout) throws IOException {
+                             String password, String keyFile, int timeout) {
     // get connection from pool
     ConnectionInfo info = new ConnectionInfo(host, port, user);
     ChannelSftp channel = getFromPool(info);
@@ -138,7 +142,7 @@ class SFTPConnectionPool {
 
     // create a new connection and add to pool
     JSch jsch = new JSch();
-    Session session = null;
+    Session session;
     try {
       if (user == null || user.length() == 0) {
         user = System.getProperty("user.name");
@@ -175,13 +179,16 @@ class SFTPConnectionPool {
       }
 
       return channel;
-
     } catch (JSchException e) {
-      throw new IOException(StringUtils.stringifyException(e));
+      String errorReason = "Unable to create connection. Please retry.";
+      String errorMessage = String.format("Unable to create connection, aborting process. Failure reason is %s.",
+        e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(StringUtils.stringifyException(e)));
     }
   }
 
-  void disconnect(ChannelSftp channel) throws IOException {
+  void disconnect(ChannelSftp channel) {
     if (channel != null) {
       // close connection if too many active connections
       boolean closeConnection = false;
@@ -199,10 +206,14 @@ class SFTPConnectionPool {
             channel.disconnect();
             session.disconnect();
           } catch (JSchException e) {
-            throw new IOException(StringUtils.stringifyException(e));
+            ConnectionInfo info = con2infoMap.get(channel);
+            String errorReason = String.format("Error encountered while closing connection to %s", info.getHost());
+            String errorMessage = String.format("Error encountered while closing connection to %s, aborting process. " +
+              "Failure reason is %s.", info.getHost(), e.getMessage());
+            throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+              errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(StringUtils.stringifyException(e)));
           }
         }
-
       } else {
         returnToPool(channel);
       }
@@ -298,6 +309,5 @@ class SFTPConnectionPool {
       }
       return hashCode;
     }
-
   }
 }

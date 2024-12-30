@@ -19,6 +19,9 @@ package io.cdap.plugin.batch.source.ftp;
 import com.jcraft.jsch.ChannelSftp;
 import com.jcraft.jsch.JSchException;
 import com.jcraft.jsch.Session;
+import io.cdap.cdap.api.exception.ErrorCategory;
+import io.cdap.cdap.api.exception.ErrorType;
+import io.cdap.cdap.api.exception.ErrorUtils;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.mapreduce.lib.input.LineRecordReader;
@@ -66,13 +69,18 @@ class SFTPInputStream extends FSInputStream {
 
   // We don't support seek unless the current position is same as the desired position.
   @Override
-  public void seek(long position) throws IOException {
+  public void seek(long position) {
     // If seek is to the current pos, then simply return. This logic was added so that the seek call in
     // LineRecordReader#initialize method to '0' does not fail.
-    if (getPos() == position) {
-      return;
+    try {
+      if (getPos() == position) {
+        return;
+      }
+    } catch (IOException e) {
+      String errorMessage = String.format(E_SEEK_NOTSUPPORTED + "Failure reason is %s.", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        E_SEEK_NOTSUPPORTED, errorMessage, ErrorType.SYSTEM, true, new IOException(E_SEEK_NOTSUPPORTED));
     }
-    throw new IOException(E_SEEK_NOTSUPPORTED);
   }
 
   @Override
@@ -86,56 +94,85 @@ class SFTPInputStream extends FSInputStream {
   }
 
   @Override
-  public synchronized int read() throws IOException {
+  public synchronized int read() {
     if (closed) {
-      throw new IOException(E_STREAM_CLOSED);
-    }
-
-    int byteRead = wrappedStream.read();
-    if (byteRead >= 0) {
-      pos++;
-    }
-    if (stats != null & byteRead >= 0) {
-      stats.incrementBytesRead(1);
-    }
-    return byteRead;
-  }
-
-  @Override
-  public synchronized int read(byte[] buf, int off, int len)
-    throws IOException {
-    if (closed) {
-      throw new IOException(E_STREAM_CLOSED);
-    }
-
-    int result = wrappedStream.read(buf, off, len);
-    if (result > 0) {
-      pos += result;
-    }
-    if (stats != null & result > 0) {
-      stats.incrementBytesRead(result);
-    }
-
-    return result;
-  }
-
-  @Override
-  public synchronized void close() throws IOException {
-    if (closed) {
-      return;
-    }
-    super.close();
-    closed = true;
-    if (!channel.isConnected()) {
-      throw new IOException(E_CLIENT_NOTCONNECTED);
+      String errorMessage = "Unable to read, stream closed unexpectedly.";
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        E_STREAM_CLOSED, errorMessage, ErrorType.SYSTEM, true, new IOException(E_STREAM_CLOSED));
     }
 
     try {
+      int byteRead = wrappedStream.read();
+      if (byteRead >= 0) {
+        pos++;
+      }
+      if (stats != null & byteRead >= 0) {
+        stats.incrementBytesRead(1);
+      }
+      return byteRead;
+    } catch (IOException e) {
+      String errorReason = "Unable to read wrapped input stream.";
+      String errorMessage = String.format("Failed to read wrapped input stream with reason %s ", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
+    }
+  }
+
+  @Override
+  public synchronized int read(byte[] buf, int off, int len) {
+    if (closed) {
+      String errorReason = E_STREAM_CLOSED + " Unable to read.";
+      String errorMessage = String.format("Stream closed. Failed to read buffer stream of length %s and offset %s",
+        len, off);
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(E_STREAM_CLOSED));
+    }
+
+    int result = 0;
+    try {
+      result = wrappedStream.read(buf, off, len);
+      if (result > 0) {
+        pos += result;
+      }
+      if (stats != null & result > 0) {
+        stats.incrementBytesRead(result);
+      }
+
+      return result;
+    } catch (IOException e) {
+      String errorReason = "Unable to read wrapped input stream.";
+      String errorMessage = String.format("Failed to read wrapped input stream of length %s and offset %s " +
+        "with reason: %s", len, off, e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
+    }
+  }
+
+  @Override
+  public synchronized void close() {
+    try {
+      if (closed) {
+        return;
+      }
+      super.close();
+      closed = true;
+      if (!channel.isConnected()) {
+        throw new IOException(E_CLIENT_NOTCONNECTED);
+      }
+
       Session session = channel.getSession();
       channel.disconnect();
       session.disconnect();
     } catch (JSchException e) {
-      throw new IOException(StringUtils.stringifyException(e));
+      String errorReason = "Error occurred while retrieving session.";
+      String errorMessage = String.format("Failed to retrieving session with reason: %s", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, new IOException(StringUtils.stringifyException(e)));
+    } catch (IOException e) {
+      String errorReason = "Error occurred while closing stream.";
+      String errorMessage = String.format("Failed to close stream with reason: %s", e.getMessage());
+      throw ErrorUtils.getProgramFailureException(new ErrorCategory(ErrorCategory.ErrorCategoryEnum.PLUGIN),
+        errorReason, errorMessage, ErrorType.SYSTEM, true, e);
     }
   }
 }

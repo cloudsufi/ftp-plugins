@@ -23,6 +23,7 @@ import io.cdap.cdap.api.annotation.Plugin;
 import io.cdap.cdap.etl.api.FailureCollector;
 import io.cdap.cdap.etl.api.batch.BatchSource;
 import io.cdap.cdap.etl.api.batch.BatchSourceContext;
+import io.cdap.cdap.etl.api.exception.ErrorDetailsProviderSpec;
 import io.cdap.plugin.common.Asset;
 import io.cdap.plugin.common.LineageRecorder;
 import io.cdap.plugin.common.ReferenceNames;
@@ -56,6 +57,9 @@ public class FTPBatchSource extends AbstractFileSource<FTPConfig> {
       : config.getReferenceName();
     asset = Asset.builder(referenceName)
       .setFqn(config.getPath()).build();
+
+    // set error details provider
+    context.setErrorDetailsProvider(new ErrorDetailsProviderSpec(FTPErrorDetailsProvider.class.getName()));
 
     // super is called down here to avoid instantiating the lineage recorder with a null asset
     super.prepareRun(context);
