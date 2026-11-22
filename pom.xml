@@ -43,7 +43,7 @@
     <junit.version>4.11</junit.version>
     <mockito.version>2.24.0</mockito.version>
     <guava.version>13.0.1</guava.version>
-    <jackson.version>2.13.0</jackson.version>
+    <jackson.version>2.18.11</jackson.version>
     <surefire.redirectTestOutputToFile>true</surefire.redirectTestOutputToFile>
   </properties>
 
